@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use actix_web::{delete, get, HttpResponse, post, Scope, web};
 use actix_web::web::{Bytes, Data, Json, Query};
+use regex::{Regex};
 use serde::{Deserialize, Serialize};
 use crate::repository::data_repository::DataRepository;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
     key: String
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatchRemoveQuery {
+    pattern: String,
+    limit: usize
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,7 +35,7 @@ pub struct KeysReturn {
 
 #[get("/read")]
 pub async fn read(query: Query<ReadQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
-    match DataRepository::read(data.as_ref().clone(), &query.key).await{
+    match DataRepository::read(data.as_ref().to_owned(), &query.key).await{
         None => { HttpResponse::NotFound().body("") }
         Some(v) => { HttpResponse::Ok()
             .content_type("application/octet-stream")
@@ -57,9 +64,36 @@ pub async fn lifetime_read(query: Query<ReadQuery>, data: Data<Arc<DataRepositor
 
 #[delete("/remove")]
 pub async fn remove(query: Query<ReadQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
-    data.remove(&query.key).await;
+    tokio::spawn(async move {
+        data.remove(&query.key).await;
+    });
     HttpResponse::Ok()
         .body("")
+}
+
+#[delete("/match-remove")]
+pub async fn match_remove(query: Query<MatchRemoveQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
+    match Regex::new(&*query.pattern){
+        Ok(regex) => {
+            let affected = DataRepository::match_remove(data.as_ref().to_owned(), regex,
+                                                        query.limit).await;
+            HttpResponse::Ok()
+                .content_type("application/octet-stream")
+                .body(affected.to_be_bytes().to_vec())
+        }
+        Err(_) => {
+            HttpResponse::BadRequest()
+                .body("")
+        }
+    }
+}
+
+#[delete("/all")]
+pub async fn remove_all(data: Data<Arc<DataRepository>>) -> HttpResponse {
+    let affected = DataRepository::clean(data.as_ref().to_owned()).await;
+    HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .body(affected.to_be_bytes().to_vec())
 }
 
 fn handle_utf8(opt: Option<Vec<u8>>) -> HttpResponse {
@@ -79,7 +113,7 @@ fn handle_utf8(opt: Option<Vec<u8>>) -> HttpResponse {
 
 #[get("/read-string")]
 pub async fn read_string(query: Query<ReadQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
-    handle_utf8(DataRepository::read(data.as_ref().clone(), &query.key).await)
+    handle_utf8(DataRepository::read(data.as_ref().to_owned(), &query.key).await)
 }
 #[get("/safe-read-string")]
 pub async fn safe_read_string(query: Query<ReadQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
@@ -114,7 +148,7 @@ pub async fn load(limit: Query<LimitQuery>, dump_data: Bytes, data: Data<Arc<Dat
         Some(v) => if v == 0 { u16::MAX as u32 } else { v },
         None => u16::MAX as u32
     };
-    let affected = DataRepository::load(data.as_ref().clone(), dump_data.to_vec(),
+    let affected = DataRepository::load(data.as_ref().to_owned(), dump_data.to_vec(),
                                         limit).await;
     HttpResponse::Ok()
         .content_type("application/octet-stream")
@@ -166,6 +200,9 @@ pub fn map() -> Scope {
         .service(dump)
         .service(load_json)
         .service(load)
+        .service(remove)
+        .service(match_remove)
+        .service(remove_all)
         .service(write)
         .service(write_string)
 }

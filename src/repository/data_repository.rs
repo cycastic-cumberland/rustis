@@ -5,6 +5,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use base64::Engine;
+use regex::Regex;
 use tokio::sync::RwLock;
 use crate::repository::data_partition::DataPartition;
 
@@ -89,6 +90,43 @@ impl DataRepository {
         let partition_lock = &self.partitions[(hash % self.size) as usize];
         let mut partition = partition_lock.write().await;
         partition.map.remove(key);
+    }
+    pub async fn match_remove(this: Arc<Self>, regex: Regex, limit: usize) -> usize{
+        let mut cleaned = 0usize;
+        for partition_lock in &this.partitions{
+            let partition = partition_lock.read().await;
+            for (key, _) in &partition.map {
+                if !regex.is_match(key) {
+                    continue;
+                }
+                let cloned_self = this.clone();
+                let cloned_key = key.clone();
+                tokio::spawn(async move {
+                    cloned_self.remove(&cloned_key).await
+                });
+                cleaned += 1;
+                if cleaned >= limit {
+                    return cleaned;
+                }
+            }
+        }
+
+        cleaned
+    }
+    pub async fn clean(this: Arc<Self>) -> usize {
+        let mut cleaned = 0usize;
+        for partition_lock in &this.partitions {
+            let partition = partition_lock.read().await;
+            for (key, _) in &partition.map {
+                let cloned_self = this.clone();
+                let cloned_key = key.clone();
+                tokio::spawn(async move {
+                    cloned_self.remove(&cloned_key).await
+                });
+                cleaned += 1;
+            }
+        }
+        cleaned
     }
     pub async fn all_keys(&self) -> Vec<String> {
         let mut keys: Vec<String>  = Vec::new();

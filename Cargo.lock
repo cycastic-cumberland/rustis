@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "rustis"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "actix-web",
  "base64",
@@ -927,6 +927,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
