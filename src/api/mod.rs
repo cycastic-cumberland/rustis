@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use actix_web::{delete, get, HttpResponse, post, Scope, web};
 use actix_web::web::{Bytes, Data, Json, Query};
-use regex::{Regex};
 use serde::{Deserialize, Serialize};
 use crate::repository::data_repository::DataRepository;
 
@@ -73,10 +72,9 @@ pub async fn remove(query: Query<ReadQuery>, data: Data<Arc<DataRepository>>) ->
 
 #[delete("/match-remove")]
 pub async fn match_remove(query: Query<MatchRemoveQuery>, data: Data<Arc<DataRepository>>) -> HttpResponse {
-    match Regex::new(&*query.pattern){
-        Ok(regex) => {
-            let affected = DataRepository::match_remove(data.as_ref().to_owned(), regex,
-                                                        query.limit).await;
+    match DataRepository::match_remove(data.as_ref().to_owned(), &query.pattern,
+                                       query.limit).await{
+        Ok(affected) => {
             HttpResponse::Ok()
                 .content_type("application/octet-stream")
                 .body(affected.to_be_bytes().to_vec())

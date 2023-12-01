@@ -2,38 +2,49 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use base64::Engine;
 use regex::Regex;
 use tokio::sync::RwLock;
 use crate::repository::data_partition::DataPartition;
+use crate::repository::regex_machine_partition::RegexMachinePartition;
 
 const DEFAULT_PARTITION_COUNT: u16 = 16;
 
 pub struct DataRepository {
-    partitions: Vec<RwLock<DataPartition>>,
-    size: u64
+    data_partitions: Vec<RwLock<DataPartition>>,
+    regex_partitions: Vec<Mutex<RegexMachinePartition>>,
+    data_size: u64,
+    regex_size: u64,
 }
 
 impl DataRepository {
-    pub fn new(partition_count: u16) -> Self {
-        let mut partitions: Vec<RwLock<DataPartition>> = Vec::with_capacity((
-            if partition_count == 0 { DEFAULT_PARTITION_COUNT } else { partition_count }) as usize);
-        for _ in 0..partition_count{
-            partitions.push(RwLock::new(DataPartition::new()));
+    pub fn new(data_partition_count: u16, regex_partition_count: u16, regex_partition_capacity: u16) -> Self {
+        let mut data_partitions: Vec<RwLock<DataPartition>> = Vec::with_capacity((
+            if data_partition_count == 0 { DEFAULT_PARTITION_COUNT } else { data_partition_count }) as usize);
+        for _ in 0..data_partition_count {
+            data_partitions.push(RwLock::new(DataPartition::new()));
         }
-        let size = partitions.len() as u64;
+        let mut regex_partitions: Vec<Mutex<RegexMachinePartition>> = Vec::with_capacity((
+            if regex_partition_count == 0 { DEFAULT_PARTITION_COUNT } else { data_partition_count }) as usize);
+        for _ in 0..regex_partition_count {
+            regex_partitions.push(Mutex::new(RegexMachinePartition::new(regex_partition_capacity)));
+        }
+        let s1 = data_partitions.len() as u64;
+        let s2 = regex_partitions.len() as u64;
         DataRepository{
-            partitions,
-            size
+            data_partitions,
+            regex_partitions,
+            data_size: s1,
+            regex_size: s2
         }
     }
     pub async fn read(this: Arc<DataRepository>, key: &String) -> Option<Vec<u8>> {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let partition_lock = &this.partitions[(hash % this.size) as usize];
+        let partition_lock = &this.data_partitions[(hash % this.data_size) as usize];
         let partition = partition_lock.read().await;
         if let Some((reference, limit)) = partition.map.get(key) {
             let lim = limit.fetch_sub(1, Ordering::AcqRel) - 1;
@@ -51,7 +62,7 @@ impl DataRepository {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let partition_lock = &self.partitions[(hash % self.size) as usize];
+        let partition_lock = &self.data_partitions[(hash % self.data_size) as usize];
         let partition = partition_lock.read().await;
         if let Some((reference, _)) = partition.map.get(key) {
             Some(reference.clone())
@@ -63,7 +74,7 @@ impl DataRepository {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let partition_lock = &self.partitions[(hash % self.size) as usize];
+        let partition_lock = &self.data_partitions[(hash % self.data_size) as usize];
         let partition = partition_lock.read().await;
         if let Some((_, limit)) = partition.map.get(key) {
             Some(limit.load(Ordering::Acquire))
@@ -75,7 +86,7 @@ impl DataRepository {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let partition_lock = &self.partitions[(hash % self.size) as usize];
+        let partition_lock = &self.data_partitions[(hash % self.data_size) as usize];
         let mut partition = partition_lock.write().await;
         partition.map.insert(key, (value, AtomicU32::from(read_limit)));
     }
@@ -87,50 +98,72 @@ impl DataRepository {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let partition_lock = &self.partitions[(hash % self.size) as usize];
+        let partition_lock = &self.data_partitions[(hash % self.data_size) as usize];
         let mut partition = partition_lock.write().await;
         partition.map.remove(key);
     }
-    pub async fn match_remove(this: Arc<Self>, regex: Regex, limit: usize) -> usize{
+    fn get_regex(&self, pattern: &String) -> Result<Arc<Regex>, String> {
+        let mut hasher = DefaultHasher::new();
+        pattern.hash(&mut hasher);
+        let hash = hasher.finish();
+        let partition_lock = &self.regex_partitions[(hash % self.regex_size) as usize];
+        let mut partition = partition_lock.lock().unwrap();
+        let cache = &mut partition.map;
+        if let Some(v) = cache.get(pattern) {
+            return Ok(v.clone());
+        }
+        match Regex::new(pattern) {
+            Ok(regex) => {
+                let arc = Arc::new(regex);
+                cache.put(pattern.clone(), arc.clone());
+                Ok(arc)
+            }
+            Err(e) => {
+                Err(e.to_string())
+            }
+        }
+    }
+    pub async fn match_remove(this: Arc<Self>, pattern: &String, limit: usize) -> Result<usize, String> {
+        let regex_result = this.get_regex(pattern);
+        if let Err(e) = regex_result {
+            return Err(e);
+        }
+        let regex = regex_result.unwrap();
         let mut cleaned = 0usize;
-        for partition_lock in &this.partitions{
+        for partition_lock in &this.data_partitions {
             let partition = partition_lock.read().await;
-            for (key, _) in &partition.map {
+            let immutable_map = &partition.map;
+            for (key, _) in immutable_map.iter() {
                 if !regex.is_match(key) {
                     continue;
                 }
-                let cloned_self = this.clone();
                 let cloned_key = key.clone();
+                let cloned_self = this.clone();
                 tokio::spawn(async move {
-                    cloned_self.remove(&cloned_key).await
+                    cloned_self.remove(&cloned_key).await;
                 });
                 cleaned += 1;
                 if cleaned >= limit {
-                    return cleaned;
+                    return Ok(cleaned);
                 }
             }
         }
 
-        cleaned
+        Ok(cleaned)
     }
     pub async fn clean(this: Arc<Self>) -> usize {
         let mut cleaned = 0usize;
-        for partition_lock in &this.partitions {
-            let partition = partition_lock.read().await;
-            for (key, _) in &partition.map {
-                let cloned_self = this.clone();
-                let cloned_key = key.clone();
-                tokio::spawn(async move {
-                    cloned_self.remove(&cloned_key).await
-                });
-                cleaned += 1;
-            }
+        for partition_lock in &this.data_partitions {
+            let mut partition = partition_lock.write().await;
+            let map = &mut partition.map;
+            cleaned += map.len();
+            map.clear();
         }
         cleaned
     }
     pub async fn all_keys(&self) -> Vec<String> {
         let mut keys: Vec<String>  = Vec::new();
-        for partition_lock in &self.partitions {
+        for partition_lock in &self.data_partitions {
             let partition = partition_lock.read().await;
             for (key, _) in &partition.map {
                 keys.push(key.clone());
@@ -140,7 +173,7 @@ impl DataRepository {
     }
     pub async fn dump(&self) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
-        for partition_lock in &self.partitions {
+        for partition_lock in &self.data_partitions {
             let partition = partition_lock.read().await;
             for (key, (value, _)) in &partition.map {
                 let mut key_bytes = key.clone().into_bytes();
@@ -155,7 +188,7 @@ impl DataRepository {
     }
     pub async fn dump_json(&self) -> HashMap<String, String> {
         let mut map: HashMap<String, String>  = HashMap::new();
-        for partition_lock in &self.partitions {
+        for partition_lock in &self.data_partitions {
             let partition = partition_lock.read().await;
             for (key, (value, _)) in &partition.map {
                 let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(value);

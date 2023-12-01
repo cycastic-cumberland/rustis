@@ -7,7 +7,7 @@ pub(crate) struct DataPartition {
 
 impl DataPartition{
     pub fn new() -> Self {
-        DataPartition {
+        Self {
             map: HashMap::new()
         }
     }

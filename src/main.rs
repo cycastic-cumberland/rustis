@@ -29,12 +29,16 @@ async fn main() -> std::io::Result<()> {
         Ok(cfg) => cfg,
         Err(e) => panic!("Failed to deserialize application configuration with exception: {}", e.to_string())
     };
-    let partition_count = config.partition_count;
-    let repository = Arc::new(DataRepository::new(partition_count));
+    let data_partition_count = config.partition_count;
+    let regex_partition_count = config.regex_partition_count;
+    let regex_partition_capacity = config.regex_partition_capacity;
+    let repository = Arc::new(DataRepository::new(data_partition_count, regex_partition_count, regex_partition_capacity));
     std::env::set_var("RUST_LOG", config.log_level);
     std::env::set_var("RUST_BACKTRACE", "1");
     env_logger::init();
-    log!(Level::Info, "Partition count: {partition_count}");
+    log!(Level::Info, "Data partition count: {data_partition_count}");
+    log!(Level::Info, "Regex partition count: {regex_partition_count}");
+    log!(Level::Info, "Regex partition capacity: {regex_partition_capacity}");
     log!(Level::Info, "Online at {HOST}:{PORT}");
 
     HttpServer::new(move || {
